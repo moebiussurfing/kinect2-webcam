@@ -1,5 +1,7 @@
 # kinect2-webcam
 
+**v1.0** · [Release notes](CHANGELOG.md)
+
 Use a Kinect v2 as a webcam on Linux, with colour grading, retro and cinema looks, built-in LUTs,
 auto brightness and a live preview.
 
@@ -52,7 +54,8 @@ mkdir -p ~/.config/systemd/user ~/.local/share/applications
 cp packaging/kinect2-webcam.service ~/.config/systemd/user/
 cp packaging/local.manu.KinectWebcam.desktop ~/.local/share/applications/
 systemctl --user daemon-reload
-systemctl --user enable --now kinect2-webcam
+# Open Kinect Webcam to start the camera. Login autostart is optional:
+# systemctl --user enable kinect2-webcam
 ```
 
 Opening "Kinect Webcam" from the app menu activates the camera; you can then turn it off and change settings.
@@ -90,11 +93,18 @@ scene correction; adjust intensity or exposure for your lighting after loading.
 Use the **← / →** buttons next to the dropdown to browse factory and personal presets with
 immediate application. Navigation stops at the first/last preset (no wrapping).
 
+The header **Day / Night** toggle switches the panel theme. The choice is saved in
+`~/.config/kinect2-webcam-ui.json` and restored on the next launch, independently of image settings.
+
 Use **Save** in the Look header to save the current settings under a unique name. Personal entries
 appear as **Saved · name** in the same dropdown and persist in `~/.config/kinect2-webcam-presets.json`.
 Factory recipes live in the app code, stay separate from your file and cannot be overwritten by saving.
 Presets include all image settings (including exposure and mirror), but not webcam on/off, live preview
 or login autostart. Loading restores a complete configuration, not cumulative effects.
+
+**Delete preset** below Look removes only the selected personal preset, after confirmation
+(Cancel is the default). Factory presets are protected. Deleting leaves the current image untouched
+and saves a recovery copy beside the preset file as `kinect2-webcam-presets.json.bak-DATE-TIME`.
 
 The panel no longer imports external LUT files. Existing legacy settings/personal presets are preserved;
 if they reference a custom `.cube`, keep it in place to load them. No old files are deleted.

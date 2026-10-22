@@ -68,6 +68,32 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(cfg['lut'], '')
         self.assertFalse(self.path.exists())
 
+    def test_delete_personal_preset_keeps_recoverable_backup(self):
+        m.save_preset('Natural', self.cfg)
+        m.save_preset('Keep', self.cfg)
+        before = self.path.read_bytes()
+        backup = m.delete_preset('Natural')
+        self.assertEqual(backup.read_bytes(), before)
+        self.assertEqual(m.read_presets(), {'Keep': self.cfg})
+        self.assertIn('Natural', m.FACTORY_PRESETS)
+        with self.assertRaises(ValueError):
+            m.delete_preset('Missing')
+
+    def test_delete_refuses_corrupt_personal_file(self):
+        self.path.write_text('corrupt')
+        with self.assertRaises(ValueError):
+            m.delete_preset('Natural')
+        self.assertEqual(self.path.read_text(), 'corrupt')
+
+    def test_failed_delete_write_keeps_original_and_backup(self):
+        m.save_preset('Keep', self.cfg)
+        before = self.path.read_bytes()
+        with patch.object(m, 'write_json_atomic', side_effect=OSError('disk error')):
+            with self.assertRaises(OSError):
+                m.delete_preset('Keep')
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(next(self.path.parent.glob('presets.json.bak-*')).read_bytes(), before)
+
 
 class PanelTests(unittest.TestCase):
     @classmethod
@@ -84,6 +110,7 @@ class PanelTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         for key, value in {
             'PRESETS_PATH': Path(self.tmp.name) / 'presets.json',
+            'UI_SETTINGS_PATH': Path(self.tmp.name) / 'ui.json',
             'CONFIG_PATH': Path(self.tmp.name) / 'camera.conf',
             'service_active': lambda: False, 'service_enabled': lambda: False,
             'kinect_connected': lambda: True,
@@ -99,6 +126,8 @@ class PanelTests(unittest.TestCase):
         p = patch.object(m, 'Preview')
         p.start()
         self.addCleanup(p.stop)
+        scheme = m.Adw.StyleManager.get_default().get_color_scheme()
+        self.addCleanup(m.Adw.StyleManager.get_default().set_color_scheme, scheme)
         self.win = m.Window(self.app)
         self.addCleanup(self.cleanup_window)
 
@@ -278,6 +307,86 @@ class PanelTests(unittest.TestCase):
         self.assertFalse(w.next_preset_button.get_sensitive())
         w.previous_preset_button.emit('clicked')
         self.assertEqual(w._collect(), m.FACTORY_PRESETS['Moonlight'])
+
+    def test_delete_requires_confirmation_and_cancel_preserves_data(self):
+        w = self.win
+        m.save_preset('Studio', {**m.DEFAULTS, **m.STRING_DEFAULTS})
+        w._reload_presets('Studio')
+        before = m.PRESETS_PATH.read_bytes()
+        self.assertTrue(w.delete_preset_button.get_sensitive())
+        w.delete_preset_button.emit('clicked')
+        dialog = w.get_visible_dialog()
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog.get_default_response(), 'cancel')
+        self.assertEqual(m.PRESETS_PATH.read_bytes(), before)
+        dialog.emit('response', 'cancel')
+        dialog.close()
+        self.assertEqual(m.PRESETS_PATH.read_bytes(), before)
+        self.assertFalse(m.CONFIG_PATH.exists())
+        self.ctl.assert_not_called()
+
+    def test_confirm_delete_keeps_other_presets_and_current_image(self):
+        w = self.win
+        cfg = {**m.DEFAULTS, **m.STRING_DEFAULTS, 'gamma': 1.7}
+        m.save_preset('Delete', cfg)
+        m.save_preset('Keep', cfg)
+        w._reload_presets()
+        w.preset_row.set_selected(w._preset_entries.index(('user', 'Delete')))
+        before = m.CONFIG_PATH.read_bytes()
+        self.ctl.reset_mock()
+        w.delete_preset_button.emit('clicked')
+        dialog = w.get_visible_dialog()
+        dialog.emit('response', 'delete')
+        dialog.close()
+        self.assertEqual(m.read_presets(), {'Keep': cfg})
+        self.assertEqual(m.CONFIG_PATH.read_bytes(), before)
+        self.assertEqual(w._collect(), cfg)
+        self.assertEqual(w.preset_row.get_selected(), 0)
+        self.assertFalse(w.delete_preset_button.get_sensitive())
+        self.assertTrue(list(m.PRESETS_PATH.parent.glob('presets.json.bak-*')))
+        self.ctl.assert_not_called()
+
+    def test_factory_delete_is_disabled_and_handler_cannot_delete_it(self):
+        w = self.win
+        w.preset_row.set_selected(1)
+        self.assertFalse(w.delete_preset_button.get_sensitive())
+        w.on_delete_preset(None)
+        self.assertIsNone(w.get_visible_dialog())
+        self.assertIn('Natural', m.FACTORY_PRESETS)
+        self.assertFalse(m.PRESETS_PATH.exists())
+
+    def test_theme_toggle_roundtrip_and_window_restore(self):
+        w = self.win
+        for dark, name in ((True, 'dark'), (False, 'light')):
+            w.theme_button.set_active(not dark)
+            w.theme_button.set_active(dark)
+            self.assertEqual(m.Adw.StyleManager.get_default().get_dark(), dark)
+            self.assertEqual(m.read_ui_settings(), {'theme': name})
+            self.assertEqual(w.theme_label.get_label(), 'Night' if dark else 'Day')
+        restored = m.Window(self.app)
+        try:
+            self.assertFalse(restored.theme_button.get_active())
+        finally:
+            restored.on_close()
+            restored.destroy()
+        self.assertFalse(m.CONFIG_PATH.exists())
+        self.assertFalse(m.PRESETS_PATH.exists())
+        self.ctl.assert_not_called()
+
+    def test_theme_manager_sync_does_not_write_preferences(self):
+        manager = m.Adw.StyleManager.get_default()
+        manager.set_color_scheme(m.Adw.ColorScheme.FORCE_LIGHT)
+        self.assertFalse(self.win.theme_button.get_active())
+        manager.set_color_scheme(m.Adw.ColorScheme.FORCE_DARK)
+        self.assertTrue(self.win.theme_button.get_active())
+        self.assertFalse(m.UI_SETTINGS_PATH.exists())
+        self.assertFalse(m.CONFIG_PATH.exists())
+
+    def test_invalid_theme_settings_are_safe_to_read(self):
+        for raw in ('corrupt', '[]', '{"version":1,"theme":"invalid"}'):
+            m.UI_SETTINGS_PATH.write_text(raw)
+            self.assertEqual(m.read_ui_settings(), {})
+            self.assertEqual(m.UI_SETTINGS_PATH.read_text(), raw)
 
     def test_close_flushes_pending_settings(self):
         self.win.gamma_row.set_value(1.6)

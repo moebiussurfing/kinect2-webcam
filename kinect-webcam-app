@@ -3,6 +3,8 @@
 import json
 import math
 import os
+import shutil
+from datetime import datetime
 import tempfile
 import struct
 import subprocess
@@ -185,19 +187,53 @@ def save_preset(name, cfg):
     if name in presets:
         raise ValueError("That name already exists. Please choose a different name.")
     presets[name] = cfg
-    PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(PRESETS_PATH, {"version": 1, "presets": presets})
+    return name
+
+
+def write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=PRESETS_PATH.parent,
-                                         prefix=PRESETS_PATH.name + ".", delete=False) as out:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as out:
             tmp = Path(out.name)
-            json.dump({"version": 1, "presets": presets}, out, indent=2, ensure_ascii=False, allow_nan=False)
+            json.dump(data, out, indent=2, ensure_ascii=False, allow_nan=False)
             out.write("\n")
-        tmp.replace(PRESETS_PATH)
+        tmp.replace(path)
     finally:
         if tmp is not None and tmp.exists():
             tmp.unlink()
-    return name
+
+
+def delete_preset(name):
+    presets = read_presets()
+    if name not in presets:
+        raise ValueError("This personal preset no longer exists.")
+    backup = PRESETS_PATH.with_name(PRESETS_PATH.name + datetime.now().strftime(".bak-%Y%m%d-%H%M%S-%f"))
+    shutil.copy2(PRESETS_PATH, backup)  # Keep an exact recovery copy before removing anything.
+    del presets[name]
+    write_json_atomic(PRESETS_PATH, {"version": 1, "presets": presets})
+    return backup
+
+
+UI_SETTINGS_PATH = Path.home() / ".config" / "kinect2-webcam-ui.json"
+
+
+def read_ui_settings():
+    try:
+        data = json.loads(UI_SETTINGS_PATH.read_text())
+        if isinstance(data, dict) and data.get("version") == 1 and data.get("theme") in ("light", "dark"):
+            return {"theme": data["theme"]}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_theme(theme):
+    if theme not in ("light", "dark"):
+        raise ValueError("Unknown theme.")
+    write_json_atomic(UI_SETTINGS_PATH, {"version": 1, "theme": theme})
 
 
 # Factory recipes live in code, independently of the user's preset file.
@@ -254,6 +290,7 @@ SECTION_CSS = """
 .section-toggle .section-sign { opacity: .65; }
 .section-action { margin-right: 0; border-radius: 10px; min-height: 34px; padding: 0 12px; }
 .section-body { border-spacing: 0; }
+.preset-delete:disabled { color: alpha(@window_fg_color, .5); opacity: 1; }
 .preset-navigation { margin-left: 8px; }
 .preset-step { min-width: 36px; min-height: 36px; padding: 0; border-radius: 10px; background: alpha(@window_fg_color, .05); }
 .preset-step:hover { background: alpha(@accent_bg_color, .16); }
@@ -376,9 +413,12 @@ class Preview:
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=1000)
+        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=1040)
         self._syncing = False
         self._apply_source = 0
+        theme = read_ui_settings().get("theme")
+        if theme:
+            Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK if theme == "dark" else Adw.ColorScheme.FORCE_LIGHT)
         self._looks = list_looks()
         # No external-file importer. Preserve old configurations without deleting their files.
         self._luts = [("none", "None")] + list_luts()
@@ -446,6 +486,13 @@ class Window(Adw.ApplicationWindow):
             button.connect("clicked", lambda _button, delta=step: self._step_preset(delta))
             self.preset_navigation.append(button)
         self.preset_row.add_suffix(self.preset_navigation)
+        self.preset_actions = Gtk.Box(spacing=12, margin_top=12)
+        self.preset_actions.append(Gtk.Label(label="Personal presets only", xalign=0, hexpand=True,
+                                            css_classes=["caption", "dim-label"]))
+        self.delete_preset_button = Gtk.Button(label="Delete preset", valign=Gtk.Align.CENTER,
+                                               css_classes=["flat", "destructive-action", "preset-delete"])
+        self.delete_preset_button.connect("clicked", self.on_delete_preset)
+        self.preset_actions.append(self.delete_preset_button)
         self._reload_presets()
         for row in (self.preset_row, self.look_row, self.strength_row, self.letterbox_row):
             look_group.add(row)
@@ -508,6 +555,8 @@ class Window(Adw.ApplicationWindow):
         ]
         for index, (group, subtitle, icon, style) in enumerate(sections):
             section = ControlSection(group.get_title(), subtitle, icon, style, group, expanded=index < 2)
+            if style == "look":
+                section.body.append(self.preset_actions)
             self.group_expanders.append(section)
             controls.append(section)
         scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, child=Adw.Clamp(maximum_size=460, child=controls))
@@ -518,7 +567,21 @@ class Window(Adw.ApplicationWindow):
         body.append(scroller)
 
         view = Adw.ToolbarView()
-        view.add_top_bar(Adw.HeaderBar())
+        header = Adw.HeaderBar()
+        self.theme_button = Gtk.ToggleButton(css_classes=["flat"], valign=Gtk.Align.CENTER)
+        self.theme_icon = Gtk.Image(pixel_size=16)
+        self.theme_label = Gtk.Label()
+        theme_content = Gtk.Box(spacing=6)
+        theme_content.append(self.theme_icon)
+        theme_content.append(self.theme_label)
+        self.theme_button.set_child(theme_content)
+        self.theme_button.set_active(Adw.StyleManager.get_default().get_dark())
+        self._update_theme_button()
+        self.theme_button.connect("toggled", self.on_theme_toggled)
+        self._theme_syncing = False
+        self._theme_signal = Adw.StyleManager.get_default().connect("notify::dark", self._sync_theme_from_manager)
+        header.pack_end(self.theme_button)
+        view.add_top_bar(header)
         self.toasts = Adw.ToastOverlay(child=body)
         view.set_content(self.toasts)
         self.set_content(view)
@@ -641,6 +704,9 @@ class Window(Adw.ApplicationWindow):
         last = len(self._preset_entries) - 1
         self.previous_preset_button.set_sensitive(1 < index <= last)
         self.next_preset_button.set_sensitive(0 <= index < last)
+        personal = 0 < index <= last and self._preset_entries[index][0] == "user"
+        self.delete_preset_button.set_sensitive(personal)
+        self.delete_preset_button.set_tooltip_text("Delete the selected personal preset" if personal else "Select a personal preset; factory presets cannot be deleted")
 
     def _step_preset(self, delta):
         index = self.preset_row.get_selected()
@@ -652,6 +718,61 @@ class Window(Adw.ApplicationWindow):
         self._sync_preset_navigation()
         if not self._preset_reloading and not self._syncing:
             self.on_load_preset(None)
+
+    def _update_theme_button(self):
+        dark = self.theme_button.get_active()
+        self.theme_icon.set_from_icon_name("weather-clear-night-symbolic" if dark else "weather-clear-symbolic")
+        self.theme_label.set_label("Night" if dark else "Day")
+        self.theme_button.set_tooltip_text("Switch to day mode" if dark else "Switch to night mode")
+        self.theme_button.update_property([Gtk.AccessibleProperty.LABEL], ["Night mode"])
+
+    def _sync_theme_from_manager(self, *_args):
+        self._theme_syncing = True
+        try:
+            self.theme_button.set_active(Adw.StyleManager.get_default().get_dark())
+            self._update_theme_button()
+        finally:
+            self._theme_syncing = False
+
+    def on_theme_toggled(self, button):
+        if self._theme_syncing:
+            return
+        dark = button.get_active()
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
+        self._update_theme_button()
+        try:
+            save_theme("dark" if dark else "light")
+        except (OSError, ValueError) as exc:
+            self._message(f"Theme changed, but could not save preference: {exc}")
+
+    def on_delete_preset(self, _button):
+        index = self.preset_row.get_selected()
+        if not 0 < index < len(self._preset_entries):
+            return
+        origin, name = self._preset_entries[index]
+        if origin != "user":
+            return
+        dialog = Adw.AlertDialog(heading="Delete preset?",
+                                 body=f"Remove “{name}” from your saved presets? The current image will not change. A recovery copy will be kept.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete preset")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def response(_dialog, choice):
+            if choice != "delete":
+                return
+            try:
+                delete_preset(name)
+            except (OSError, ValueError) as exc:
+                self._message(f"Could not delete preset: {exc}")
+                return
+            self._reload_presets()  # Placeholder only: do not load a neighbour or change the image.
+            self._message(f"Preset deleted: {name}")
+
+        dialog.connect("response", response)
+        dialog.present(self)
 
     def on_save_preset(self, _button):
         entry = Gtk.Entry(placeholder_text="Preset name", activates_default=True)
@@ -738,6 +859,9 @@ class Window(Adw.ApplicationWindow):
             GLib.source_remove(self._refresh_source)
             self._refresh_source = 0
         self.preview.stop()
+        if self._theme_signal:
+            Adw.StyleManager.get_default().disconnect(self._theme_signal)
+            self._theme_signal = 0
         Gtk.StyleContext.remove_provider_for_display(self.get_display(), self._css_provider)
         return False
 
