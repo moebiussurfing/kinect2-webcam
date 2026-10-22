@@ -1,6 +1,9 @@
 #!/usr/bin/python3
 """GTK4/libadwaita panel for the Kinect v2 virtual webcam: on/off, image settings, looks, live preview."""
+import json
+import math
 import os
+import tempfile
 import struct
 import subprocess
 import sys
@@ -127,6 +130,191 @@ def write_config(cfg):
     systemctl("kill", "-s", "HUP", SERVICE)
 
 
+PRESETS_PATH = Path.home() / ".config" / "kinect2-webcam-presets.json"
+LIMITS = {
+    "exposure": (-2, 2), "gamma": (.3, 3), "mirror": (0, 1),
+    "manual_exposure": (0, 1), "exposure_ms": (1, 66), "gain": (1, 4),
+    "auto_brightness": (0, 1), "auto_target": (.25, .7),
+    "brightness": (-.3, .3), "contrast": (.5, 1.5), "saturation": (0, 2),
+    "temperature": (-1, 1), "look_strength": (0, 1), "letterbox": (0, 1),
+    "lut_strength": (0, 1),
+}
+
+
+def validate_preset(cfg):
+    if not isinstance(cfg, dict) or set(cfg) != set(DEFAULTS) | set(STRING_DEFAULTS):
+        raise ValueError("The preset does not contain the expected image settings.")
+    for key, (low, high) in LIMITS.items():
+        value = cfg[key]
+        if (type(value) not in (int, float) or not math.isfinite(value)
+                or not low <= value <= high):
+            raise ValueError(f"Invalid preset setting: {key}")
+        if key in ("mirror", "manual_exposure", "auto_brightness", "letterbox") and value not in (0, 1):
+            raise ValueError(f"Invalid switch setting: {key}")
+    for key in STRING_DEFAULTS:
+        value = cfg[key]
+        if not isinstance(value, str) or any(ord(c) < 32 for c in value):
+            raise ValueError(f"Invalid preset text: {key}")
+    return dict(cfg)
+
+
+def validate_preset_name(name):
+    if not isinstance(name, str) or not name.strip() or len(name) > 80 or any(ord(c) < 32 for c in name):
+        raise ValueError("Use a preset name of 1–80 characters.")
+    return name.strip()
+
+
+def read_presets():
+    try:
+        data = json.loads(PRESETS_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("presets"), dict):
+        raise ValueError("Unrecognized preset file. Your saved presets have not been changed.")
+    for name, cfg in data["presets"].items():
+        if validate_preset_name(name) != name:
+            raise ValueError("Invalid saved preset name.")
+        validate_preset(cfg)
+    return data["presets"]
+
+
+def save_preset(name, cfg):
+    name = validate_preset_name(name)
+    cfg = validate_preset(cfg)
+    presets = read_presets()  # Never replace an unreadable or corrupt file.
+    if name in presets:
+        raise ValueError("That name already exists. Please choose a different name.")
+    presets[name] = cfg
+    PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=PRESETS_PATH.parent,
+                                         prefix=PRESETS_PATH.name + ".", delete=False) as out:
+            tmp = Path(out.name)
+            json.dump({"version": 1, "presets": presets}, out, indent=2, ensure_ascii=False, allow_nan=False)
+            out.write("\n")
+        tmp.replace(PRESETS_PATH)
+    finally:
+        if tmp is not None and tmp.exists():
+            tmp.unlink()
+    return name
+
+
+# Factory recipes live in code, independently of the user's preset file.
+# Every recipe starts from a complete neutral configuration: no cumulative grading.
+FACTORY_RECIPES = [
+    ("Natural", {}),
+    ("Soft Portrait", dict(lut_preset="warm_portrait", lut_strength=.65, contrast=.95, saturation=.95, brightness=.02)),
+    ("Golden Hour", dict(lut_preset="golden_hour", lut_strength=.8, temperature=.2, gamma=.95)),
+    ("Cool Morning", dict(lut_preset="cool_morning", lut_strength=.7, temperature=-.2, contrast=.95)),
+    ("Vivid Studio", dict(lut_preset="vivid_pop", lut_strength=.65, contrast=1.1, saturation=1.15)),
+    ("Pastel Dream", dict(lut_preset="soft_pastel", lut_strength=.85, contrast=.85, saturation=.85, brightness=.04)),
+    ("Analog Film", dict(look="analog", look_strength=.7, lut_preset="faded_vintage", lut_strength=.35, temperature=.1)),
+    ("Vintage Print", dict(look="polaroid", look_strength=.8, lut_preset="two_strip", lut_strength=.35, saturation=.85)),
+    ("Cinema Teal", dict(look="cinema_teal", look_strength=.6, lut_preset="teal_orange", lut_strength=.4, letterbox=1.0)),
+    ("Cinema Warm", dict(look="cinema_warm", look_strength=.75, lut_preset="golden_hour", lut_strength=.25, letterbox=1.0)),
+    ("Cinema Cold", dict(look="cinema_cold", look_strength=.7, lut_preset="moody_teal", lut_strength=.4, letterbox=1.0)),
+    ("Noir", dict(look="noir", look_strength=.85, lut_preset="noir_contrast", lut_strength=.45, contrast=1.15, letterbox=1.0)),
+    ("Silver B&W", dict(look="bw", look_strength=1.0, lut_preset="silver_gelatin", lut_strength=.8, contrast=1.05)),
+    ("Sepia Archive", dict(lut_preset="sepia", lut_strength=.9, saturation=.8, contrast=.9, temperature=.1)),
+    ("Cyanotype", dict(lut_preset="cyanotype", lut_strength=1.0, contrast=1.1, saturation=.9)),
+    ("80s TV", dict(look="tv80", look_strength=.8, lut_preset="faded_vintage", lut_strength=.25, saturation=1.1)),
+    ("CRT Arcade", dict(look="crt", look_strength=.75, lut_preset="cross_process", lut_strength=.4, saturation=1.2)),
+    ("Matrix", dict(look="green", look_strength=.55, lut_preset="matrix_green", lut_strength=.6, contrast=1.15)),
+    ("Neon Night", dict(lut_preset="cyberpunk_neon", lut_strength=.85, contrast=1.15, saturation=1.2, gamma=1.1)),
+    ("Moonlight", dict(lut_preset="day_for_night", lut_strength=.75, temperature=-.3, gamma=1.15, saturation=.75)),
+]
+FACTORY_PRESETS = {name: {**DEFAULTS, **STRING_DEFAULTS, **recipe} for name, recipe in FACTORY_RECIPES}
+
+SECTION_CSS = """
+.control-section {
+    background-color: @card_bg_color;
+    border: 1px solid alpha(@window_fg_color, .09);
+    border-radius: 18px;
+    box-shadow: 0 2px 5px alpha(black, .06);
+}
+.section-header { padding: 12px; }
+.section-toggle {
+    padding: 8px;
+    border: none;
+    border-radius: 12px;
+    background: transparent;
+    box-shadow: none;
+    outline-offset: -2px;
+}
+.section-toggle:hover { background-color: alpha(@window_fg_color, .05); }
+.section-toggle:checked { background: transparent; }
+.section-toggle:checked:hover { background-color: alpha(@window_fg_color, .05); }
+.section-badge { min-width: 36px; min-height: 36px; border-radius: 11px; }
+.section-webcam .section-badge { background: alpha(#27ae80, .16); color: #27ae80; }
+.section-look .section-badge { background: alpha(#a474e8, .16); color: #a474e8; }
+.section-lut .section-badge { background: alpha(#e6a245, .16); color: #e6a245; }
+.section-image .section-badge { background: alpha(#479fd7, .16); color: #479fd7; }
+.section-camera .section-badge { background: alpha(#df748b, .16); color: #df748b; }
+.section-toggle .section-sign { opacity: .65; }
+.section-action { margin-right: 0; border-radius: 10px; min-height: 34px; padding: 0 12px; }
+.section-body { border-spacing: 0; }
+.preset-navigation { margin-left: 8px; }
+.preset-step { min-width: 36px; min-height: 36px; padding: 0; border-radius: 10px; background: alpha(@window_fg_color, .05); }
+.preset-step:hover { background: alpha(@accent_bg_color, .16); }
+.preset-step:disabled { background: transparent; }
+"""
+
+
+class ControlSection(Gtk.Box):
+    """Accessible card accordion with a plus/minus button instead of a tree arrow."""
+
+    def __init__(self, title, subtitle, icon, style, group, expanded=False):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, css_classes=["control-section", "section-" + style])
+        group.set_title("")
+        action = group.get_header_suffix()
+        if action is not None:
+            group.set_header_suffix(None)
+            action.add_css_class("section-action")
+        header = Gtk.Box(spacing=4, css_classes=["section-header"])
+        self.toggle = Gtk.ToggleButton(hexpand=True, css_classes=["section-toggle"])
+        content = Gtk.Box(spacing=12, hexpand=True, halign=Gtk.Align.FILL)
+        self.badge_icon = Gtk.Image(icon_name=icon, pixel_size=20, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        self.badge = Gtk.CenterBox(center_widget=self.badge_icon, width_request=36, height_request=36,
+                                   halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, hexpand=False,
+                                   css_classes=["section-badge"])
+        content.append(self.badge)
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, valign=Gtk.Align.CENTER, hexpand=True)
+        labels.append(Gtk.Label(label=title, xalign=0, css_classes=["heading"]))
+        labels.append(Gtk.Label(label=subtitle, xalign=0, css_classes=["caption", "dim-label"]))
+        content.append(labels)
+        self.sign = Gtk.Image(css_classes=["section-sign"], pixel_size=16, width_request=32, height_request=32, margin_start=8)
+        content.append(self.sign)
+        self.toggle.set_child(content)
+        header.append(self.toggle)
+        if action is not None:
+            header.append(action)
+        self.append(header)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_top=18, margin_bottom=20,
+                            margin_start=20, margin_end=20, css_classes=["section-body"])
+        self.body.append(group)
+        self.revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+                                    transition_duration=180, child=self.body)
+        self.append(self.revealer)
+
+        def toggled(button):
+            opened = button.get_active()
+            self.revealer.set_reveal_child(opened)
+            self.sign.set_from_icon_name("list-remove-symbolic" if opened else "list-add-symbolic")
+            button.set_tooltip_text(("Collapse " if opened else "Expand ") + title)
+            button.update_property([Gtk.AccessibleProperty.LABEL], [title])
+
+        self.toggle.connect("toggled", toggled)
+        self.toggle.set_active(expanded)
+        toggled(self.toggle)
+
+    def get_expanded(self):
+        return self.toggle.get_active()
+
+    def set_expanded(self, expanded):
+        self.toggle.set_active(expanded)
+
+
 class Preview:
     """Shows the frames the service publishes (already processed). Never opens the camera device,
     so other apps such as Meet can keep using it."""
@@ -188,13 +376,19 @@ class Preview:
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=760)
+        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=1000)
         self._syncing = False
         self._apply_source = 0
         self._looks = list_looks()
-        # None first, then the built-in LUTs, then a user-supplied .cube file.
-        self._luts = [("none", "None")] + list_luts() + [("file", "Custom file (.cube)")]
+        # No external-file importer. Preserve old configurations without deleting their files.
+        self._luts = [("none", "None")] + list_luts()
         cfg = read_config()
+        if cfg["lut_preset"] == "file":
+            self._luts.append(("file", "Legacy saved grade"))
+        provider = Gtk.CssProvider()
+        provider.load_from_string(SECTION_CSS)
+        self._css_provider = provider
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         # --- Preview ---------------------------------------------------------------------
         self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, hexpand=True, vexpand=True)
@@ -235,17 +429,25 @@ class Window(Adw.ApplicationWindow):
                                        cfg["look_strength"], 0.0, 1.0, 0.05, 2)
         self.letterbox_row = Adw.SwitchRow(title="Cinema bars", subtitle="Black bars at 2.39:1")
         self.letterbox_row.set_active(bool(cfg["letterbox"]))
-        self.lut_row = Adw.ActionRow(title="Custom file")
-        self.lut_path = cfg["lut"]
-        choose = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
-        choose.connect("clicked", self.on_choose_lut)
-        clear = Gtk.Button(icon_name="edit-clear-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Remove the LUT")
-        clear.connect("clicked", self.on_clear_lut)
-        self.lut_row.add_suffix(choose)
-        self.lut_row.add_suffix(clear)
-        self._update_lut_subtitle()
+        self.lut_path = cfg["lut"]  # Compatibility only: no file chooser in the panel.
         look_group = Adw.PreferencesGroup(title="Look")
-        for row in (self.look_row, self.strength_row, self.letterbox_row):
+        save = Gtk.Button(label="Save", tooltip_text="Save current settings as a personal preset", valign=Gtk.Align.CENTER)
+        save.connect("clicked", self.on_save_preset)
+        look_group.set_header_suffix(save)
+        self.preset_row = Adw.ComboRow(title="Preset", use_subtitle=True)
+        self.preset_navigation = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER, css_classes=["preset-navigation"])
+        self.previous_preset_button = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Previous preset",
+                                                width_request=36, height_request=36, css_classes=["flat", "preset-step"])
+        self.next_preset_button = Gtk.Button(icon_name="go-next-symbolic", tooltip_text="Next preset",
+                                            width_request=36, height_request=36, css_classes=["flat", "preset-step"])
+        for button, label, step in ((self.previous_preset_button, "Previous preset", -1),
+                                    (self.next_preset_button, "Next preset", 1)):
+            button.update_property([Gtk.AccessibleProperty.LABEL], [label])
+            button.connect("clicked", lambda _button, delta=step: self._step_preset(delta))
+            self.preset_navigation.append(button)
+        self.preset_row.add_suffix(self.preset_navigation)
+        self._reload_presets()
+        for row in (self.preset_row, self.look_row, self.strength_row, self.letterbox_row):
             look_group.add(row)
 
         lut_ids = [i for i, _l in self._luts]
@@ -255,7 +457,7 @@ class Window(Adw.ApplicationWindow):
         self.lut_strength_row = self._spin("LUT intensity", "How strongly the LUT is applied (1 = full).",
                                            cfg["lut_strength"], 0.0, 1.0, 0.05, 2)
         lut_group = Adw.PreferencesGroup(title="Colour LUT")
-        for row in (self.lut_combo, self.lut_strength_row, self.lut_row):
+        for row in (self.lut_combo, self.lut_strength_row):
             lut_group.add(row)
 
         # --- Image -----------------------------------------------------------------------
@@ -294,12 +496,22 @@ class Window(Adw.ApplicationWindow):
         for row in (self.letterbox_row, self.auto_row, self.manual_row):
             row.connect("notify::active", self.on_image_changed)
 
-        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24, margin_top=12, margin_bottom=12,
+        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, margin_top=12, margin_bottom=12,
                            margin_start=6, margin_end=12)
-        for group in (webcam_group, look_group, lut_group, image_group, camera_group):
-            controls.append(group)
+        self.group_expanders = []
+        sections = [
+            (webcam_group, "Stream & startup", "camera-web-symbolic", "webcam"),
+            (look_group, "20 factory + your presets", "applications-graphics-symbolic", "look"),
+            (lut_group, "Built-in colour grades", "color-select-symbolic", "lut"),
+            (image_group, "Light & colour", "display-brightness-symbolic", "image"),
+            (camera_group, "Exposure & sensor", "camera-photo-symbolic", "camera"),
+        ]
+        for index, (group, subtitle, icon, style) in enumerate(sections):
+            section = ControlSection(group.get_title(), subtitle, icon, style, group, expanded=index < 2)
+            self.group_expanders.append(section)
+            controls.append(section)
         scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, child=Adw.Clamp(maximum_size=460, child=controls))
-        scroller.set_size_request(400, -1)
+        scroller.set_size_request(430, -1)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         body.append(preview_box)
@@ -307,13 +519,14 @@ class Window(Adw.ApplicationWindow):
 
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
-        view.set_content(body)
+        self.toasts = Adw.ToastOverlay(child=body)
+        view.set_content(self.toasts)
         self.set_content(view)
         self.connect("close-request", self.on_close)
         self._bind_spins()  # after the initial values are set, so building the window writes nothing
 
         self.refresh()
-        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+        self._refresh_source = GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
 
     @staticmethod
     def _spin(title, subtitle, value, lower, upper, step, digits):
@@ -349,7 +562,12 @@ class Window(Adw.ApplicationWindow):
 
     def _run_async(self, *args):
         def work():
-            systemctl(*args)
+            try:
+                result = systemctl(*args)
+                if result.returncode:
+                    GLib.idle_add(self._message, result.stderr.strip() or "Could not change the webcam service.")
+            except OSError as exc:
+                GLib.idle_add(self._message, str(exc))
             GLib.idle_add(self.refresh)
 
         threading.Thread(target=work, daemon=True).start()
@@ -363,6 +581,8 @@ class Window(Adw.ApplicationWindow):
             self._run_async("enable" if row.get_active() else "disable", SERVICE)
 
     def on_image_changed(self, *_args):
+        if self._syncing:
+            return
         # Debounce: wait for the spin buttons to settle before writing and reloading.
         if self._apply_source:
             GLib.source_remove(self._apply_source)
@@ -388,6 +608,120 @@ class Window(Adw.ApplicationWindow):
         write_config(self._collect())
         return False
 
+    def _message(self, message):
+        self.toasts.add_toast(Adw.Toast(title=message))
+        return False
+
+    def _reload_presets(self, selected=None):
+        # Model replacement/Save must never autoload a transient or newly saved entry.
+        self._preset_reloading = True
+        try:
+            try:
+                self._preset_names = sorted(read_presets(), key=str.casefold)
+                error = None
+            except (OSError, ValueError) as exc:
+                self._preset_names = []
+                error = str(exc)
+            self._preset_entries = [None] + [("factory", name) for name in FACTORY_PRESETS]
+            self._preset_entries += [("user", name) for name in self._preset_names]
+            labels = ["Choose a preset…"] + [f"{i:02d} · {name}" for i, name in enumerate(FACTORY_PRESETS, 1)]
+            labels += ["Saved · " + name for name in self._preset_names]
+            self.preset_row.set_model(Gtk.StringList.new(labels))
+            self.preset_row.set_tooltip_text(error or "Choose a factory or saved preset to apply it immediately.")
+            self.preset_row.set_selected(self._preset_entries.index(("user", selected)) if selected in self._preset_names else 0)
+        finally:
+            self._preset_reloading = False
+        self._sync_preset_navigation()
+        if not getattr(self, "_preset_connected", False):
+            self.preset_row.connect("notify::selected", self.on_preset_selected)
+            self._preset_connected = True
+
+    def _sync_preset_navigation(self):
+        index = self.preset_row.get_selected()
+        last = len(self._preset_entries) - 1
+        self.previous_preset_button.set_sensitive(1 < index <= last)
+        self.next_preset_button.set_sensitive(0 <= index < last)
+
+    def _step_preset(self, delta):
+        index = self.preset_row.get_selected()
+        target = index + delta
+        if 1 <= target < len(self._preset_entries):
+            self.preset_row.set_selected(target)  # Same autoload path as the dropdown; one write.
+
+    def on_preset_selected(self, *_args):
+        self._sync_preset_navigation()
+        if not self._preset_reloading and not self._syncing:
+            self.on_load_preset(None)
+
+    def on_save_preset(self, _button):
+        entry = Gtk.Entry(placeholder_text="Preset name", activates_default=True)
+        dialog = Adw.AlertDialog(heading="Save preset", body="Save the current look, LUT, image and exposure settings.",
+                                 extra_child=entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+        dialog.set_response_enabled("save", False)
+        entry.connect("changed", lambda e: dialog.set_response_enabled("save", bool(e.get_text().strip())))
+
+        def response(_dialog, choice):
+            if choice != "save":
+                return
+            try:
+                name = save_preset(entry.get_text(), self._collect())
+            except (OSError, ValueError) as exc:
+                self._message(str(exc))
+                return
+            self._reload_presets(name)
+            self._message(f"Preset saved: {name}")
+
+        dialog.connect("response", response)
+        dialog.present(self)
+
+    def on_load_preset(self, _button):
+        index = self.preset_row.get_selected()
+        if not 0 < index < len(self._preset_entries):
+            return
+        origin, name = self._preset_entries[index]
+        try:
+            cfg = validate_preset(FACTORY_PRESETS[name] if origin == "factory" else read_presets()[name])
+            look_ids = [i for i, _ in self._looks]
+            lut_ids = [i for i, _ in self._luts]
+            if cfg["look"] not in look_ids or cfg["lut_preset"] not in lut_ids + ["file"]:
+                raise ValueError("This preset uses a look or LUT unavailable in this version.")
+            if cfg["lut_preset"] == "file" and not Path(cfg["lut"]).is_file():
+                raise ValueError("The custom LUT file is missing. Restore it before loading this preset.")
+            # Write once, after all validation; do not apply intermediate widget values.
+            write_config(cfg)
+        except (OSError, ValueError, KeyError) as exc:
+            self._message(f"Could not load preset: {exc}")
+            return
+        if self._apply_source:
+            GLib.source_remove(self._apply_source)
+            self._apply_source = 0
+        self._syncing = True
+        try:
+            for key, row in (("exposure", self.exposure_row), ("gamma", self.gamma_row),
+                             ("brightness", self.brightness_row), ("contrast", self.contrast_row),
+                             ("saturation", self.saturation_row), ("temperature", self.temperature_row),
+                             ("auto_target", self.target_row), ("exposure_ms", self.ms_row),
+                             ("gain", self.gain_row), ("look_strength", self.strength_row),
+                             ("lut_strength", self.lut_strength_row)):
+                row.set_value(cfg[key])
+            for key, row in (("auto_brightness", self.auto_row), ("manual_exposure", self.manual_row),
+                             ("letterbox", self.letterbox_row)):
+                row.set_active(bool(cfg[key]))
+            self.look_row.set_selected(look_ids.index(cfg["look"]))
+            if cfg["lut_preset"] == "file" and "file" not in lut_ids:
+                self._luts.append(("file", "Legacy saved grade"))
+                lut_ids.append("file")
+                self.lut_combo.set_model(Gtk.StringList.new([label for _, label in self._luts]))
+            self.lut_combo.set_selected(lut_ids.index(cfg["lut_preset"]))
+            self.lut_path = cfg["lut"]
+        finally:
+            self._syncing = False
+
     def on_reset(self, _button):
         d = DEFAULTS
         for row, key in ((self.exposure_row, "exposure"), (self.gamma_row, "gamma"), (self.brightness_row, "brightness"),
@@ -396,44 +730,17 @@ class Window(Adw.ApplicationWindow):
             row.set_value(d[key])
         self.auto_row.set_active(False)
 
-    def _update_lut_subtitle(self):
-        name = Path(self.lut_path).name if self.lut_path else None
-        self.lut_row.set_subtitle(name or "None. Pick a .cube file; it is used when “Custom file (.cube)” is selected.")
-
-    def on_choose_lut(self, _button):
-        dialog = Gtk.FileDialog(title="Choose a .cube LUT")
-        cube = Gtk.FileFilter(name="3D LUT (.cube)")
-        cube.add_pattern("*.cube")
-        filters = Gio_list_store(cube)
-        dialog.set_filters(filters)
-
-        def done(dlg, result):
-            try:
-                path = dlg.open_finish(result).get_path()
-            except GLib.Error:
-                return
-            self.lut_path = path
-            self._update_lut_subtitle()
-            self.lut_combo.set_selected([i for i, _l in self._luts].index("file"))
-            self.on_image_changed()
-
-        dialog.open(self, None, done)
-
-    def on_clear_lut(self, _button):
-        self.lut_path = ""
-        self._update_lut_subtitle()
-        self.on_image_changed()
-
     def on_close(self, *_args):
+        if self._apply_source:
+            GLib.source_remove(self._apply_source)
+            self._apply_image_settings()
+        if self._refresh_source:
+            GLib.source_remove(self._refresh_source)
+            self._refresh_source = 0
         self.preview.stop()
+        Gtk.StyleContext.remove_provider_for_display(self.get_display(), self._css_provider)
         return False
 
-
-def Gio_list_store(file_filter):
-    from gi.repository import Gio
-    store = Gio.ListStore.new(Gtk.FileFilter)
-    store.append(file_filter)
-    return store
 
 
 class App(Adw.Application):
@@ -441,7 +748,10 @@ class App(Adw.Application):
         super().__init__(application_id=APP_ID)
 
     def do_activate(self):
-        (self.props.active_window or Window(self)).present()
+        window = self.props.active_window or Window(self)
+        window.present()
+        if not service_active():
+            window._run_async("start", SERVICE)  # Opening the GUI does not enable login autostart.
 
 
 if __name__ == "__main__":
