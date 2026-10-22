@@ -388,6 +388,9 @@ class PanelTests(unittest.TestCase):
             self.assertEqual(m.read_ui_settings(), {})
             self.assertEqual(m.UI_SETTINGS_PATH.read_text(), raw)
 
+    def test_default_window_height_has_extra_room(self):
+        self.assertEqual(tuple(self.win.get_default_size()), (1040, 1120))
+
     def test_close_flushes_pending_settings(self):
         self.win.gamma_row.set_value(1.6)
         self.assertNotEqual(self.win._apply_source, 0)

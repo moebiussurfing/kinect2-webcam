@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Increase the initial panel height from 1040 to 1120 pixels so the default controls fit without manual resizing.
+
 ## v1.0 — 2026-10-23
 
 First release of Kinect Webcam for Linux, tested on Ubuntu 26.04 with GNOME/Wayland and a Kinect v2.

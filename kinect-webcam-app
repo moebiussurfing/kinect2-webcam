@@ -413,7 +413,7 @@ class Preview:
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=1040)
+        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=1120)
         self._syncing = False
         self._apply_source = 0
         theme = read_ui_settings().get("theme")
