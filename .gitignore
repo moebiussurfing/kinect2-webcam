@@ -1,0 +1,4 @@
+# build output
+/kinect2-webcam
+# local backups
+*.bak-*
