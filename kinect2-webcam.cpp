@@ -47,7 +47,8 @@ static fx::Settings loadConfig(bool mirrorFromCli) {
 }
 
 // GUI preview: while ~/.../kinect2-webcam.want is fresh (the GUI touches it every couple of
-// seconds) the finished frame is published, downscaled, as "KWP1" + w + h + RGB24 so the GUI
+// seconds) the finished frame is published at native resolution as "KWP1" + w + h + RGB24
+// so the GUI can scale it to its viewport without enlarging a low-resolution copy and
 // never has to open the loopback device (which would block Meet and friends).
 static std::string runtimeFile(const char *name) {
   const char *dir = std::getenv("XDG_RUNTIME_DIR");
@@ -72,7 +73,7 @@ class PreviewWriter {
     if (!wanted_) return;
     if (now - lastWrite_ < std::chrono::milliseconds(30)) return;  // every frame of a 30 fps camera
     lastWrite_ = now;
-    const int pw = 480, ph = 270;
+    const int pw = w, ph = h;
     rgb_.resize(16 + static_cast<size_t>(pw) * ph * 3);
     std::memcpy(rgb_.data(), "KWP1", 4);
     const uint32_t dims[2] = {static_cast<uint32_t>(pw), static_cast<uint32_t>(ph)};

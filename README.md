@@ -87,6 +87,7 @@ it testable.
 ## Notes and limits
 
 - v4l2loopback allows one reader at a time on this setup. The control panel reads a small preview
-  file published by the service instead of the device, to leave the camera free for other apps.
+  file published at native camera resolution by the service instead of the device, to leave the
+  camera free for other apps. The panel scales that frame down to fit its viewport.
 - Looks and LUTs were tuned by eye on a single scene.
 - Only the colour stream is used. Depth is not.

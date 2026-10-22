@@ -298,7 +298,7 @@ struct Cube {
   }
 };
 
-// Nearest-neighbour downscale of a finished YUYV frame to RGB24 (BT.601), for the GUI preview.
+// Convert a finished YUYV frame to RGB24 (BT.601) for the GUI preview.
 inline void makePreview(const uint8_t *yuyv, int w, int h, int pw, int ph, uint8_t *rgb) {
   for (int py = 0; py < ph; ++py) {
     const uint8_t *row = yuyv + static_cast<size_t>(py * h / ph) * w * 2;
