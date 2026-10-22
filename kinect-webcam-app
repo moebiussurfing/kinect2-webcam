@@ -1,0 +1,448 @@
+#!/usr/bin/python3
+"""GTK4/libadwaita panel for the Kinect v2 virtual webcam: on/off, image settings, looks, live preview."""
+import os
+import struct
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk
+
+APP_ID = os.environ.get("KINECT_WEBCAM_APP_ID", "local.manu.KinectWebcam")
+SERVICE = "kinect2-webcam.service"
+VIDEO_DEVICE = "/dev/video10"
+KINECT_USB_ID = ("045e", "02c4")
+REFRESH_SECONDS = 2
+BINARY = Path.home() / ".local" / "bin" / "kinect2-webcam"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+WANT_FILE = RUNTIME_DIR / "kinect2-webcam.want"
+PREVIEW_FILE = RUNTIME_DIR / "kinect2-webcam-preview.rgb"
+
+# Keep in sync with looks() in effects.h; used only if the binary cannot list them.
+FALLBACK_LOOKS = [
+    ("none", "Natural"), ("polaroid", "Polaroid"), ("analog", "Analog film"), ("bw", "Black & white"),
+    ("crt", "CRT monitor"), ("tv80", "80s TV"), ("green", "Green monitor"),
+    ("cinema_teal", "Cinema: Teal & orange"), ("cinema_warm", "Cinema: Warm"),
+    ("cinema_cold", "Cinema: Cold"), ("noir", "Cinema: Noir"),
+]
+FALLBACK_LUTS = [
+    ("warm_portrait", "Warm Portrait"), ("golden_hour", "Golden Hour"), ("cool_morning", "Cool Morning"),
+    ("vivid_pop", "Vivid Pop"), ("soft_pastel", "Soft Pastel"), ("faded_vintage", "Faded Vintage"),
+    ("cross_process", "Cross Process"), ("bleach_bypass", "Bleach Bypass"), ("teal_orange", "Teal & Orange"),
+    ("moody_teal", "Moody Teal"), ("sepia", "Sepia"), ("cyanotype", "Cyanotype"),
+    ("noir_contrast", "Noir Contrast"), ("silver_gelatin", "Silver Gelatin"), ("day_for_night", "Day for Night"),
+    ("sunset_magenta", "Sunset Magenta"), ("matrix_green", "Matrix Green"), ("cyberpunk_neon", "Cyberpunk Neon"),
+    ("two_strip", "Two-Strip Cinema"), ("natural_boost", "Natural Boost"),
+]
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+def service_active():
+    return systemctl("is-active", SERVICE).stdout.strip() == "active"
+
+
+def service_enabled():
+    return systemctl("is-enabled", SERVICE).stdout.strip() == "enabled"
+
+
+def kinect_connected():
+    for dev in Path("/sys/bus/usb/devices").glob("*"):
+        try:
+            ids = ((dev / "idVendor").read_text().strip(), (dev / "idProduct").read_text().strip())
+        except OSError:
+            continue
+        if ids == KINECT_USB_ID:
+            return True
+    return False
+
+
+def _list_from_binary(flag, fallback):
+    try:
+        out = subprocess.run([str(BINARY), flag], capture_output=True, text=True, timeout=3).stdout
+        items = [tuple(line.split("\t", 1)) for line in out.splitlines() if "\t" in line]
+        if items:
+            return items
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return fallback
+
+
+def list_looks():
+    looks = _list_from_binary("--list-looks", FALLBACK_LOOKS)
+    return looks if looks[0][0] == "none" else FALLBACK_LOOKS
+
+
+def list_luts():
+    return _list_from_binary("--list-luts", FALLBACK_LUTS)
+
+
+CONFIG_PATH = Path.home() / ".config" / "kinect2-webcam.conf"
+DEFAULTS = {
+    "exposure": -1.0, "gamma": 1.0, "mirror": 1.0,
+    "manual_exposure": 0.0, "exposure_ms": 20.0, "gain": 1.0,
+    "auto_brightness": 0.0, "auto_target": 0.45,
+    "brightness": 0.0, "contrast": 1.0, "saturation": 1.0, "temperature": 0.0,
+    "look_strength": 1.0, "letterbox": 0.0, "lut_strength": 1.0,
+}
+STRING_DEFAULTS = {"look": "none", "lut": "", "lut_preset": "none"}
+APPLY_DELAY_MS = 300
+
+
+def read_config():
+    cfg = {**DEFAULTS, **STRING_DEFAULTS}
+    try:
+        for line in CONFIG_PATH.read_text().splitlines():
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key in STRING_DEFAULTS:
+                cfg[key] = value
+            elif key in DEFAULTS:
+                try:
+                    cfg[key] = float(value)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return cfg
+
+
+def write_config(cfg):
+    lines = [f"{k} = {cfg[k]:.2f}\n" for k in DEFAULTS]
+    lines.append(f"look = {cfg['look']}\n")
+    lines.append(f"lut_preset = {cfg['lut_preset']}\n")
+    if cfg["lut"]:
+        lines.append(f"lut = {cfg['lut']}\n")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".conf.tmp")
+    tmp.write_text("".join(lines))
+    tmp.replace(CONFIG_PATH)  # atomic: the stream may re-read the file at any moment
+    systemctl("kill", "-s", "HUP", SERVICE)
+
+
+class Preview:
+    """Shows the frames the service publishes (already processed). Never opens the camera device,
+    so other apps such as Meet can keep using it."""
+
+    INTERVAL_MS = 20
+
+    def __init__(self, picture):
+        self.picture = picture
+        self._source = 0
+        self._mtime = 0
+        self._touched = 0
+        self.has_frame = False
+
+    def start(self):
+        if self._source:
+            return
+        self._touch_want()
+        self._source = GLib.timeout_add(self.INTERVAL_MS, self._tick)
+
+    def stop(self):
+        if self._source:
+            GLib.source_remove(self._source)
+            self._source = 0
+        self.has_frame = False
+        self._mtime = 0
+        try:
+            WANT_FILE.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _touch_want():
+        try:
+            WANT_FILE.touch()  # the service publishes frames only while this file is fresh
+        except OSError:
+            pass
+
+    def _tick(self):
+        now = GLib.get_monotonic_time()
+        if now - self._touched > 1_000_000:
+            self._touch_want()
+            self._touched = now
+        try:
+            mtime = PREVIEW_FILE.stat().st_mtime_ns
+            if mtime != self._mtime:
+                self._mtime = mtime
+                data = PREVIEW_FILE.read_bytes()
+                if data[:4] == b"KWP1":
+                    w, h = struct.unpack_from("<II", data, 4)
+                    if len(data) >= 16 + w * h * 3:
+                        pixels = GLib.Bytes.new(data[16:16 + w * h * 3])
+                        self.picture.set_paintable(
+                            Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8, pixels, w * 3))
+                        self.has_frame = True
+        except OSError:
+            pass
+        return True
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Kinect Webcam", default_width=1040, default_height=760)
+        self._syncing = False
+        self._apply_source = 0
+        self._looks = list_looks()
+        # None first, then the built-in LUTs, then a user-supplied .cube file.
+        self._luts = [("none", "None")] + list_luts() + [("file", "Custom file (.cube)")]
+        cfg = read_config()
+
+        # --- Preview ---------------------------------------------------------------------
+        self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, hexpand=True, vexpand=True)
+        self.picture.add_css_class("card")
+        self.preview_note = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["dim-label"])
+        overlay = Gtk.Overlay(child=self.picture)
+        overlay.add_overlay(self.preview_note)
+        self.preview_note.set_halign(Gtk.Align.CENTER)
+        self.preview_note.set_valign(Gtk.Align.CENTER)
+        self.preview_row = Adw.SwitchRow(title="Live preview", subtitle="Effects included. Other apps can use the camera meanwhile")
+        self.preview_row.set_active(True)
+        self.preview_row.connect("notify::active", lambda *_: self.refresh())
+        preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12,
+                              margin_start=12, margin_end=6, hexpand=True)
+        preview_switch_group = Adw.PreferencesGroup()
+        preview_switch_group.add(self.preview_row)
+        preview_box.append(overlay)
+        preview_box.append(preview_switch_group)
+        overlay.set_vexpand(True)
+        self.preview = Preview(self.picture)
+
+        # --- Webcam ----------------------------------------------------------------------
+        self.active_row = Adw.SwitchRow(title="Webcam active", subtitle=f"Streams the Kinect to {VIDEO_DEVICE}")
+        self.active_row.connect("notify::active", self.on_active_toggled)
+        self.login_row = Adw.SwitchRow(title="Start at login", subtitle="Turn the webcam on when you sign in")
+        self.login_row.connect("notify::active", self.on_login_toggled)
+        self.sensor_row = Adw.ActionRow(title="Kinect sensor")
+        webcam_group = Adw.PreferencesGroup(title="Webcam")
+        for row in (self.active_row, self.login_row, self.sensor_row):
+            webcam_group.add(row)
+
+        # --- Look ------------------------------------------------------------------------
+        self.look_row = Adw.ComboRow(title="Look", subtitle="Film, video and cinema styles")
+        self.look_row.set_model(Gtk.StringList.new([label for _id, label in self._looks]))
+        ids = [i for i, _l in self._looks]
+        self.look_row.set_selected(ids.index(cfg["look"]) if cfg["look"] in ids else 0)
+        self.strength_row = self._spin("Intensity", "How strongly the look is applied (1 = full).",
+                                       cfg["look_strength"], 0.0, 1.0, 0.05, 2)
+        self.letterbox_row = Adw.SwitchRow(title="Cinema bars", subtitle="Black bars at 2.39:1")
+        self.letterbox_row.set_active(bool(cfg["letterbox"]))
+        self.lut_row = Adw.ActionRow(title="Custom file")
+        self.lut_path = cfg["lut"]
+        choose = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
+        choose.connect("clicked", self.on_choose_lut)
+        clear = Gtk.Button(icon_name="edit-clear-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Remove the LUT")
+        clear.connect("clicked", self.on_clear_lut)
+        self.lut_row.add_suffix(choose)
+        self.lut_row.add_suffix(clear)
+        self._update_lut_subtitle()
+        look_group = Adw.PreferencesGroup(title="Look")
+        for row in (self.look_row, self.strength_row, self.letterbox_row):
+            look_group.add(row)
+
+        lut_ids = [i for i, _l in self._luts]
+        self.lut_combo = Adw.ComboRow(title="LUT", subtitle="Ready-made colour grades. Combine with any look.")
+        self.lut_combo.set_model(Gtk.StringList.new([label for _id, label in self._luts]))
+        self.lut_combo.set_selected(lut_ids.index(cfg["lut_preset"]) if cfg["lut_preset"] in lut_ids else 0)
+        self.lut_strength_row = self._spin("LUT intensity", "How strongly the LUT is applied (1 = full).",
+                                           cfg["lut_strength"], 0.0, 1.0, 0.05, 2)
+        lut_group = Adw.PreferencesGroup(title="Colour LUT")
+        for row in (self.lut_combo, self.lut_strength_row, self.lut_row):
+            lut_group.add(row)
+
+        # --- Image -----------------------------------------------------------------------
+        self.auto_row = Adw.SwitchRow(title="Auto brightness", subtitle="Follows the room light, without clipping whites")
+        self.auto_row.set_active(bool(cfg["auto_brightness"]))
+        self.target_row = self._spin("Auto brightness target", "Average picture brightness to aim for.",
+                                     cfg["auto_target"], 0.25, 0.7, 0.01, 2)
+        self.exposure_row = self._spin("Exposure", "Camera auto-exposure compensation. Lower is darker.",
+                                       cfg["exposure"], -2.0, 2.0, 0.1, 1)
+        self.gamma_row = self._spin("Gamma", "Above 1 darkens midtones, below 1 lightens them.",
+                                    cfg["gamma"], 0.3, 3.0, 0.05, 2)
+        self.brightness_row = self._spin("Brightness", "Adds or removes light.", cfg["brightness"], -0.3, 0.3, 0.02, 2)
+        self.contrast_row = self._spin("Contrast", "Separates lights and darks.", cfg["contrast"], 0.5, 1.5, 0.05, 2)
+        self.saturation_row = self._spin("Saturation", "0 is black and white.", cfg["saturation"], 0.0, 2.0, 0.05, 2)
+        self.temperature_row = self._spin("Temperature", "Negative is cooler, positive is warmer.",
+                                          cfg["temperature"], -1.0, 1.0, 0.1, 1)
+        reset = Gtk.Button(label="Reset", valign=Gtk.Align.CENTER)
+        reset.connect("clicked", self.on_reset)
+        image_group = Adw.PreferencesGroup(title="Image")
+        image_group.set_header_suffix(reset)
+        for row in (self.auto_row, self.target_row, self.exposure_row, self.gamma_row, self.brightness_row,
+                    self.contrast_row, self.saturation_row, self.temperature_row):
+            image_group.add(row)
+
+        # --- Camera (manual exposure) ----------------------------------------------------
+        self.manual_row = Adw.SwitchRow(title="Manual exposure", subtitle="Fixed exposure time and gain instead of auto")
+        self.manual_row.set_active(bool(cfg["manual_exposure"]))
+        self.ms_row = self._spin("Exposure time (ms)", "Longer is brighter but blurrier.", cfg["exposure_ms"], 1.0, 66.0, 1.0, 0)
+        self.gain_row = self._spin("Gain", "Higher is brighter but noisier.", cfg["gain"], 1.0, 4.0, 0.1, 1)
+        camera_group = Adw.PreferencesGroup(title="Camera")
+        for row in (self.manual_row, self.ms_row, self.gain_row):
+            camera_group.add(row)
+
+        for row in (self.look_row, self.lut_combo):
+            row.connect("notify::selected", self.on_image_changed)
+        for row in (self.letterbox_row, self.auto_row, self.manual_row):
+            row.connect("notify::active", self.on_image_changed)
+
+        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24, margin_top=12, margin_bottom=12,
+                           margin_start=6, margin_end=12)
+        for group in (webcam_group, look_group, lut_group, image_group, camera_group):
+            controls.append(group)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, child=Adw.Clamp(maximum_size=460, child=controls))
+        scroller.set_size_request(400, -1)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        body.append(preview_box)
+        body.append(scroller)
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(body)
+        self.set_content(view)
+        self.connect("close-request", self.on_close)
+        self._bind_spins()  # after the initial values are set, so building the window writes nothing
+
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+
+    @staticmethod
+    def _spin(title, subtitle, value, lower, upper, step, digits):
+        return Adw.SpinRow(title=title, subtitle=subtitle, digits=digits,
+                           adjustment=Gtk.Adjustment(value=value, lower=lower, upper=upper, step_increment=step))
+
+    def _bind_spins(self):
+        for row in (self.strength_row, self.lut_strength_row, self.target_row, self.exposure_row, self.gamma_row, self.brightness_row,
+                    self.contrast_row, self.saturation_row, self.temperature_row, self.ms_row, self.gain_row):
+            row.connect("notify::value", self.on_image_changed)
+
+    def refresh(self):
+        active, enabled, connected = service_active(), service_enabled(), kinect_connected()
+        self._syncing = True
+        self.active_row.set_active(active)
+        self.login_row.set_active(enabled)
+        self._syncing = False
+
+        self.sensor_row.set_subtitle("Connected" if connected else "Not detected, check the USB 3 cable")
+        if self.preview_row.get_active() and active:
+            self.preview.start()
+            self.preview_note.set_label("" if self.preview.has_frame else "Waiting for video…")
+        else:
+            self.preview.stop()
+            self.picture.set_paintable(None)
+            if not connected:
+                self.preview_note.set_label("The Kinect is not connected.")
+            elif not active:
+                self.preview_note.set_label("Webcam is off.\nTurn it on to see the preview.")
+            else:
+                self.preview_note.set_label("Preview is off.")
+        return True
+
+    def _run_async(self, *args):
+        def work():
+            systemctl(*args)
+            GLib.idle_add(self.refresh)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_active_toggled(self, row, _param):
+        if not self._syncing:
+            self._run_async("start" if row.get_active() else "stop", SERVICE)
+
+    def on_login_toggled(self, row, _param):
+        if not self._syncing:
+            self._run_async("enable" if row.get_active() else "disable", SERVICE)
+
+    def on_image_changed(self, *_args):
+        # Debounce: wait for the spin buttons to settle before writing and reloading.
+        if self._apply_source:
+            GLib.source_remove(self._apply_source)
+        self._apply_source = GLib.timeout_add(APPLY_DELAY_MS, self._apply_image_settings)
+
+    def _collect(self):
+        cfg = read_config()  # keeps keys this window does not edit, such as mirror
+        cfg.update({
+            "exposure": self.exposure_row.get_value(), "gamma": self.gamma_row.get_value(),
+            "brightness": self.brightness_row.get_value(), "contrast": self.contrast_row.get_value(),
+            "saturation": self.saturation_row.get_value(), "temperature": self.temperature_row.get_value(),
+            "auto_brightness": float(self.auto_row.get_active()), "auto_target": self.target_row.get_value(),
+            "manual_exposure": float(self.manual_row.get_active()), "exposure_ms": self.ms_row.get_value(),
+            "gain": self.gain_row.get_value(), "look_strength": self.strength_row.get_value(), "lut_strength": self.lut_strength_row.get_value(),
+            "letterbox": float(self.letterbox_row.get_active()),
+            "look": self._looks[self.look_row.get_selected()][0], "lut": self.lut_path,
+            "lut_preset": self._luts[self.lut_combo.get_selected()][0],
+        })
+        return cfg
+
+    def _apply_image_settings(self):
+        self._apply_source = 0
+        write_config(self._collect())
+        return False
+
+    def on_reset(self, _button):
+        d = DEFAULTS
+        for row, key in ((self.exposure_row, "exposure"), (self.gamma_row, "gamma"), (self.brightness_row, "brightness"),
+                         (self.contrast_row, "contrast"), (self.saturation_row, "saturation"),
+                         (self.temperature_row, "temperature"), (self.target_row, "auto_target")):
+            row.set_value(d[key])
+        self.auto_row.set_active(False)
+
+    def _update_lut_subtitle(self):
+        name = Path(self.lut_path).name if self.lut_path else None
+        self.lut_row.set_subtitle(name or "None. Pick a .cube file; it is used when “Custom file (.cube)” is selected.")
+
+    def on_choose_lut(self, _button):
+        dialog = Gtk.FileDialog(title="Choose a .cube LUT")
+        cube = Gtk.FileFilter(name="3D LUT (.cube)")
+        cube.add_pattern("*.cube")
+        filters = Gio_list_store(cube)
+        dialog.set_filters(filters)
+
+        def done(dlg, result):
+            try:
+                path = dlg.open_finish(result).get_path()
+            except GLib.Error:
+                return
+            self.lut_path = path
+            self._update_lut_subtitle()
+            self.lut_combo.set_selected([i for i, _l in self._luts].index("file"))
+            self.on_image_changed()
+
+        dialog.open(self, None, done)
+
+    def on_clear_lut(self, _button):
+        self.lut_path = ""
+        self._update_lut_subtitle()
+        self.on_image_changed()
+
+    def on_close(self, *_args):
+        self.preview.stop()
+        return False
+
+
+def Gio_list_store(file_filter):
+    from gi.repository import Gio
+    store = Gio.ListStore.new(Gtk.FileFilter)
+    store.append(file_filter)
+    return store
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        (self.props.active_window or Window(self)).present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

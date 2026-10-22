@@ -1,0 +1,11 @@
+[Unit]
+Description=Kinect v2 as a virtual webcam
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/kinect2-webcam
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kinect Webcam
+Comment=Turn the Kinect v2 virtual webcam on or off
+Exec=kinect-webcam-app
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=local.manu.KinectWebcam
